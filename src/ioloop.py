@@ -1,13 +1,18 @@
 #! /usr/bin/python3.5
 
 import socket
-from select import select
-from logging import getLogger
+import logging
+from select import poll, POLLIN, POLLOUT, POLLHUP, POLLERR, POLLNVAL
 from collections import defaultdict
 
 RECV_BUFF = 2048
 PORT = 5000
-logger = getLogger(__name__)
+logger = logging.getLogger(__name__)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.DEBUG)
 
 def main():
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -16,36 +21,53 @@ def main():
     listener.bind(('', PORT))
     listener.listen(50)
 
-    to_send = defaultdict(list)
-    to_read, to_write, to_exc = [listener], [], []
+    sockets = {listener.fileno(): listener}
+    bytes_to_send = bytes_received = defaultdict(bytes)
+
+    poll_object = poll()
+    poll_object.register(listener, POLLIN)
     while True:
-        readable, writable, _ = select(to_read, to_write, to_exc)
+        fd, event = poll_object.poll()[0]
+        sock = sockets[fd]
 
-        for sock in readable:
-            if sock is listener:
-                sock, addr = listener.accept()
-                logger.error('succeeded in accepting %s from %s', sock.fileno(), addr)
-                to_read.append(sock)
+        if event & (POLLHUP | POLLERR | POLLNVAL):
+            rb = bytes_received.pop(sock, b'')
+            sb = bytes_to_send.pop(sock, b'')
+            if rb:
+                logger.error('received %s from client %s but aborted', rb, fd)
+            elif sb:
+                logger.error('prepared to send %s to client %s but aborted', sb, fd)
             else:
-                rv = sock.recv(RECV_BUFF)
-                if not rv:
-                    to_send[sock] = b''.join(to_send[sock])
-                    to_write.append(sock)
-                    to_read.remove(sock)
-                else:
-                    logger.error('succeeded in receiving %s bytes from %s', len(rv), sock.fileno())
-                    to_send[sock].append(rv)
+                logger.info('succeeded in closing %s normally', fd)
+            poll_object.unregister(fd)
+            del sockets[fd]
 
-        for sock in writable:
-            content = to_send[sock]
-            sent = sock.send(content)
-            if sent < len(content):
-                to_send[sock] = content[:-sent]
-                logger.error('succeeded in sending %s bytes to %s, remaining', sent, sock.filenoe())
+        elif sock is listener:
+            sock, address = listener.accept()
+            logger.info('succeeded in accepting client %s from %s', sock.fileno(), address)
+            sock.setblocking(False)
+            sockets[sock.fileno()] = sock
+            poll_object.register(sock, POLLIN)
+
+        elif event & POLLIN:
+            data = sock.recv(RECV_BUFF)
+            if not data:
+                logger.debug('succeeded in receiving FIN from client %s', fd)
+                sock.close()
             else:
-                del to_send[sock]
-                to_write.remove(sock)
-                logger.error('succeeded in send %s bytes to %s, preparing to close', sent, sock.fileno())
+                logger.debug('succeeded in receiving %s from client %s', data, fd)
+                bytes_received[sock] += data
+                if data.endswith(b'\n'):
+                    poll_object.modify(sock, POLLOUT)
+
+        elif event & POLLOUT:
+            data = bytes_to_send.pop(sock, b'')
+            sent = sock.send(data)
+            logger.debug('succeeded in sending %s bytes to client %s', sent, fd)
+            if sent < len(data):
+                bytes_to_send[sock] = data[sent:]
+            else:
+                poll_object.modify(sock, POLLIN)
 
 
 if __name__ == '__main__':
